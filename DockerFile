@@ -1,9 +1,0 @@
-FROM gcc:latest as builder
-WORKDIR /app
-COPY main.cpp .
-RUN g++ -O3 main.cpp -o backend_app
-
-FROM debian:stable-slim
-WORKDIR /app
-COPY --from=builder /app/backend_app .
-CMD ["./backend_app"]
