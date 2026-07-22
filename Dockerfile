@@ -1,16 +1,37 @@
-# Stage 1: Compile the C++ binary using GCC
-FROM gcc:latest as builder
-WORKDIR /app
-COPY main.cpp .
-RUN g++ -O3 main.cpp -o backend_app
+# Step 1: Build environment
+FROM ubuntu:22.04 AS builder
 
-# Stage 2: Create a secure runtime container environment
-FROM debian:stable-slim
-WORKDIR /app
-COPY --from=builder /app/backend_app .
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Expose port 8080 as a fallback default
+# Install g++, cmake, and PostgreSQL development headers
+RUN apt-get update && apt-get install -y \
+    g++ \
+    cmake \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy C++ source files
+COPY . .
+
+# Compile C++ code with libpq linked (-lpq)
+RUN g++ -O3 main.cpp -o server -lpq
+
+# Step 2: Minimal runtime environment
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy compiled executable from builder stage
+COPY --from=builder /app/server .
+
 EXPOSE 8080
 
-# Execute the application binary
-CMD ["./backend_app"]
+CMD ["./server"]
