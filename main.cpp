@@ -8,43 +8,18 @@
 #include <unistd.h>
 #include <postgresql/libpq-fe.h>
 
-// Helper function to query student fee status from PostgreSQL
-std::string get_fee_status_from_db(const std::string& student_id, const char* db_url) {
-    if (!db_url) {
-        return "ERROR_NO_DB_URL";
+// Helper to sanitize simple string outputs for JSON
+std::string escape_json(const std::string& input) {
+    std::string output = "";
+    for (char c : input) {
+        if (c == '"') output += "\\\"";
+        else if (c == '\\') output += "\\\\";
+        else output += c;
     }
-
-    PGconn* conn = PQconnectdb(db_url);
-    if (PQstatus(conn) != CONNECTION_OK) {
-        std::cerr << "Database connection failed: " << PQerrorMessage(conn) << std::endl;
-        PQfinish(conn);
-        return "DB_CONNECTION_ERROR";
-    }
-
-    // Prepare SQL query with parameter to prevent SQL injection
-    const char* paramValues[1] = { student_id.c_str() };
-    PGresult* res = PQexecParams(
-        conn,
-        "SELECT fee_status FROM students WHERE student_id = $1;",
-        1,       // 1 parameter
-        NULL,    // Let backend deduce parameter type
-        paramValues,
-        NULL,    // Param lengths (not needed for text)
-        NULL,    // Param formats (text)
-        0        // Result format (text)
-    );
-
-    std::string status = "NOT_FOUND";
-    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0) {
-        status = PQgetvalue(res, 0, 0);
-    }
-
-    PQclear(res);
-    PQfinish(conn);
-    return status;
+    return output;
 }
 
-// Ensure students table exists and seed initial data
+// Ensure database table has all required fields and seed initial data
 void init_database(const char* db_url) {
     if (!db_url) return;
 
@@ -53,19 +28,80 @@ void init_database(const char* db_url) {
         const char* create_table_sql = 
             "CREATE TABLE IF NOT EXISTS students ("
             "  student_id VARCHAR(50) PRIMARY KEY,"
+            "  name VARCHAR(100) NOT NULL,"
+            "  surname VARCHAR(100) NOT NULL,"
+            "  phone VARCHAR(20) NOT NULL,"
+            "  centre VARCHAR(100) NOT NULL,"
+            "  batch VARCHAR(100) NOT NULL,"
             "  fee_status VARCHAR(20) NOT NULL"
             ");"
-            "INSERT INTO students (student_id, fee_status) VALUES ('STU001', 'Paid'), ('STU002', 'Pending') ON CONFLICT DO NOTHING;";
+            "INSERT INTO students (student_id, name, surname, phone, centre, batch, fee_status) "
+            "VALUES "
+            "  ('STU001', 'Rahul', 'Sharma', '+91 9876543210', 'Main Arena', 'Morning 7-9 AM', 'Paid'),"
+            "  ('STU002', 'Vatsal', 'Patel', '+91 9123456789', 'North Hub', 'Evening 5-7 PM', 'Pending') "
+            "ON CONFLICT DO NOTHING;";
 
         PGresult* res = PQexec(conn, create_table_sql);
         if (PQresultStatus(res) != PGRES_COMMAND_OK) {
             std::cerr << "Failed to init table: " << PQerrorMessage(conn) << std::endl;
         } else {
-            std::cout << "Database initialized successfully." << std::endl;
+            std::cout << "Database initialized with extended fields successfully." << std::endl;
         }
         PQclear(res);
+    } else {
+        std::cerr << "Failed to connect to DB for init: " << PQerrorMessage(conn) << std::endl;
     }
     PQfinish(conn);
+}
+
+// Query all students or search by search_term (Name/Surname/Phone/ID)
+std::string get_students_json(const char* db_url, const std::string& search_term = "") {
+    if (!db_url) return "{\"error\":\"NO_DB_URL\"}";
+
+    PGconn* conn = PQconnectdb(db_url);
+    if (PQstatus(conn) != CONNECTION_OK) {
+        PQfinish(conn);
+        return "{\"error\":\"DB_CONNECTION_ERROR\"}";
+    }
+
+    PGresult* res = nullptr;
+    if (search_term.empty()) {
+        const char* sql = "SELECT student_id, name, surname, phone, centre, batch, fee_status FROM students ORDER BY name ASC;";
+        res = PQexec(conn, sql);
+    } else {
+        std::string wildcard_search = "%" + search_term + "%";
+        const char* paramValues[1] = { wildcard_search.c_str() };
+        const char* sql = 
+            "SELECT student_id, name, surname, phone, centre, batch, fee_status FROM students "
+            "WHERE name ILIKE $1 OR surname ILIKE $1 OR phone ILIKE $1 OR student_id ILIKE $1 "
+            "ORDER BY name ASC;";
+        res = PQexecParams(conn, sql, 1, NULL, paramValues, NULL, NULL, 0);
+    }
+
+    std::ostringstream json_out;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK) {
+        int rows = PQntuples(res);
+        json_out << "[";
+        for (int i = 0; i < rows; ++i) {
+            json_out << "{"
+                     << "\"student_id\":\"" << escape_json(PQgetvalue(res, i, 0)) << "\","
+                     << "\"name\":\"" << escape_json(PQgetvalue(res, i, 1)) << "\","
+                     << "\"surname\":\"" << escape_json(PQgetvalue(res, i, 2)) << "\","
+                     << "\"phone\":\"" << escape_json(PQgetvalue(res, i, 3)) << "\","
+                     << "\"centre\":\"" << escape_json(PQgetvalue(res, i, 4)) << "\","
+                     << "\"batch\":\"" << escape_json(PQgetvalue(res, i, 5)) << "\","
+                     << "\"fee_status\":\"" << escape_json(PQgetvalue(res, i, 6)) << "\""
+                     << "}";
+            if (i < rows - 1) json_out << ",";
+        }
+        json_out << "]";
+    } else {
+        json_out << "[]";
+    }
+
+    PQclear(res);
+    PQfinish(conn);
+    return json_out.str();
 }
 
 int main() {
@@ -73,7 +109,7 @@ int main() {
     if (db_url) {
         init_database(db_url);
     } else {
-        std::cout << "WARNING: DATABASE_URL not set. Running without DB." << std::endl;
+        std::cout << "WARNING: DATABASE_URL not set." << std::endl;
     }
 
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -95,12 +131,12 @@ int main() {
         return 1;
     }
 
-    if (listen(server_fd, 3) < 0) {
+    if (listen(server_fd, 5) < 0) {
         perror("Listen failed");
         return 1;
     }
 
-    std::cout << "C++ Server listening on port 8080 with PostgreSQL..." << std::endl;
+    std::cout << "C++ Server listening on port 8080 with full student schema..." << std::endl;
 
     while (true) {
         int new_socket;
@@ -110,31 +146,40 @@ int main() {
             continue;
         }
 
-        char buffer[1024] = {0};
-        read(new_socket, buffer, 1024);
+        char buffer[2048] = {0};
+        read(new_socket, buffer, 2048);
         std::string request(buffer);
 
         std::string response_body;
         std::string status_line = "HTTP/1.1 200 OK\r\n";
 
-        // Route: /get-fee-status/{id}
-        std::string route_prefix = "GET /get-fee-status/";
-        size_t pos = request.find(route_prefix);
-
-        if (pos != std::string::npos) {
-            size_t start_id = pos + route_prefix.length();
+        // Route 1: GET /students  OR  GET /students?search=Rahul
+        if (request.find("GET /students") != std::string::npos) {
+            std::string search_term = "";
+            size_t qpos = request.find("GET /students?search=");
+            if (qpos != std::string::npos) {
+                size_t start = qpos + std::string("GET /students?search=").length();
+                size_t end = request.find(" ", start);
+                search_term = request.substr(start, end - start);
+            }
+            response_body = get_students_json(db_url, search_term);
+        }
+        // Route 2: GET /get-fee-status/{id} (Legacy backward-compatible endpoint)
+        else if (request.find("GET /get-fee-status/") != std::string::npos) {
+            size_t pos = request.find("GET /get-fee-status/");
+            size_t start_id = pos + std::string("GET /get-fee-status/").length();
             size_t end_id = request.find(" ", start_id);
             std::string student_id = request.substr(start_id, end_id - start_id);
 
-            std::string fee_status = get_fee_status_from_db(student_id, db_url);
-
-            if (fee_status != "NOT_FOUND" && fee_status != "ERROR_NO_DB_URL") {
-                response_body = "{\"student_id\":\"" + student_id + "\",\"fee_status\":\"" + fee_status + "\"}";
+            std::string students_list = get_students_json(db_url, student_id);
+            if (students_list != "[]" && students_list.find("error") == std::string::npos) {
+                response_body = students_list;
             } else {
                 status_line = "HTTP/1.1 404 Not Found\r\n";
                 response_body = "{\"error\":\"Student not found\"}";
             }
-        } else {
+        } 
+        else {
             status_line = "HTTP/1.1 400 Bad Request\r\n";
             response_body = "{\"error\":\"Invalid Endpoint\"}";
         }
